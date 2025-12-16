@@ -1,27 +1,72 @@
 use axum::{
     Router,
-    extract::Path,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
+use moka::future::Cache;
+use std::net::SocketAddr;
+use std::time::Duration;
+use tower::ServiceBuilder;
+use tower_governor::{GovernorLayer, governor::GovernorConfigBuilder};
 
-#[tokio::main]
-async fn main() {
-    let app = Router::new().route("/", get(handle_index)).route(
-        "/api/calendars/train/:train_name",
-        get(handle_train_calendar),
-    );
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
-
-    println!("Server running on http://0.0.0.0:3000");
-    println!("Example: http://localhost:3000/api/calendars/train/A.ics");
-
-    axum::serve(listener, app).await.unwrap();
+#[derive(Clone)]
+struct AppState {
+    cache: Cache<String, String>,
 }
 
-async fn handle_train_calendar(Path(train_name): Path<String>) -> Response {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Cache for 30 seconds - reduces MTA API calls significantly
+    let cache = Cache::builder()
+        .max_capacity(100)
+        .time_to_live(Duration::from_secs(30))
+        .build();
+
+    let state = AppState { cache };
+
+    // Rate limiting: 10 requests per IP per second
+    let governor_conf = GovernorConfigBuilder::default()
+        .per_second(10)
+        .burst_size(20)
+        .finish()
+        .ok_or("Failed to build governor config")?;
+
+    let app = Router::new()
+        .route("/", get(handle_index))
+        .route(
+            "/api/calendars/train/:train_name",
+            get(handle_train_calendar),
+        )
+        .layer(
+            ServiceBuilder::new()
+                .layer(GovernorLayer {
+                    config: governor_conf.into(),
+                })
+                .layer(tower::limit::ConcurrencyLimitLayer::new(50)), // Max 50 concurrent requests
+        )
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
+
+    println!("Server running on http://0.0.0.0:3000");
+    println!("Rate limit: 10 req/s per IP, 30s cache, max 50 concurrent requests");
+    println!("Example: http://localhost:3000/api/calendars/train/A.ics");
+
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn handle_train_calendar(
+    State(state): State<AppState>,
+    Path(train_name): Path<String>,
+) -> Response {
     let train_name = train_name.strip_suffix(".ics").unwrap_or(&train_name);
 
     const VALID_TRAINS: &[&str] = &[
@@ -40,15 +85,34 @@ async fn handle_train_calendar(Path(train_name): Path<String>) -> Response {
             .into_response();
     }
 
-    println!("Generating calendar for train: {}", train_name);
-
-    match nyc_train_time::generate_train_ics(train_name).await {
-        Ok(ics_content) => (
+    // Check cache first
+    if let Some(cached_content) = state.cache.get(train_name).await {
+        println!("Cache hit for train: {}", train_name);
+        return (
             StatusCode::OK,
             [("Content-Type", "text/calendar; charset=utf-8")],
-            ics_content,
+            cached_content,
         )
-            .into_response(),
+            .into_response();
+    }
+
+    println!("Cache miss - fetching calendar for train: {}", train_name);
+
+    match nyc_train_time::generate_train_ics(train_name).await {
+        Ok(ics_content) => {
+            // Cache the result
+            state
+                .cache
+                .insert(train_name.to_string(), ics_content.clone())
+                .await;
+
+            (
+                StatusCode::OK,
+                [("Content-Type", "text/calendar; charset=utf-8")],
+                ics_content,
+            )
+                .into_response()
+        }
         Err(e) => {
             eprintln!("Error generating calendar: {}", e);
             (
